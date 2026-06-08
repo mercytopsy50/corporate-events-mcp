@@ -1,6 +1,6 @@
 import { EventsDB }              from "./db.js";
 import { fetchTickerMap, fetchRecentEdgar8Ks } from "./sources/edgar.js";
-import { fetchRecentRNS }        from "./sources/rns.js";
+import { fetchRecentUKFilings }  from "./sources/companies_house.js";
 import { fetchRecentASX }        from "./sources/asx.js";
 import { fetchRecentSEDAR }      from "./sources/sedar.js";
 
@@ -14,6 +14,7 @@ const INTERVALS = {
 
 // How far back to look on the first ever poll
 const INITIAL_LOOKBACK_DAYS = 3;
+const INITIAL_LOOKBACK_UK   = 90;  // Companies House: statutory filings happen weekly, not daily
 
 export class Poller {
   private readonly db: EventsDB;
@@ -52,7 +53,7 @@ export class Poller {
 
     try {
       console.log(`[poll] SEC_EDGAR since ${since}`);
-      const events = await fetchRecentEdgar8Ks(since);
+      const events = await fetchRecentEdgar8Ks(since, (cik) => this.db.getTickerByCIK(cik)?.ticker ?? null);
       this.db.upsertEvents(events);
       this.db.setPollState("SEC_EDGAR", {
         last_polled_at: new Date().toISOString(),
@@ -76,15 +77,18 @@ export class Poller {
     const ps    = this.db.getPollState("LSE_RNS");
     const since = ps.last_item_date
       ? addDays(ps.last_item_date, -1)
-      : addDays(today(), -INITIAL_LOOKBACK_DAYS);
+      : addDays(today(), -INITIAL_LOOKBACK_UK);
 
     try {
       console.log(`[poll] LSE_RNS since ${since}`);
-      const events = await fetchRecentRNS(since);
+      const events = await fetchRecentUKFilings(since);
       this.db.upsertEvents(events);
       this.db.setPollState("LSE_RNS", {
         last_polled_at: new Date().toISOString(),
-        last_item_date: today(),
+        // Only advance the cursor when events were actually found.
+        // 0 events may mean key was missing or quiet statutory period —
+        // keep the existing anchor so the next poll retains the same window.
+        last_item_date: events.length > 0 ? today() : (ps.last_item_date ?? null),
         status:         "ok",
         error:          null,
       });

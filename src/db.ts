@@ -299,6 +299,13 @@ export class EventsDB {
 
   // ── ticker cache ──────────────────────────────────────────────────────
 
+  getTickerByCIK(cik: string): { ticker: string; company_name: string } | null {
+    const row = this.db.prepare(
+      "SELECT ticker, company_name FROM ticker_cache WHERE cik = ? LIMIT 1"
+    ).get(cik) as { ticker: string; company_name: string } | undefined;
+    return row ?? null;
+  }
+
   getCachedCIK(ticker: string): { cik: string; company_name: string } | null {
     const TTL_H = 24;
     const since = new Date(Date.now() - TTL_H * 3_600_000).toISOString();

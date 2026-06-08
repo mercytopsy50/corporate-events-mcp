@@ -40,7 +40,7 @@ export function classifyRNS(category: string, headline: string): EventType {
 /** Classify an ASX announcement by its type string and headline. */
 export function classifyASX(annType: string, headline: string): EventType {
   const text = `${annType} ${headline}`;
-  if (/\b(quarterly report|half.year|annual report|results|appendix 4[CDEQ]|4E|4D|profit|revenue)\b/i.test(text)) return "earnings";
+  if (/\b(quarterly report|quarterly activities|activities report|half.year|annual report|results|appendix 4[CDEQ]|4E|4D|profit|revenue)\b/i.test(text)) return "earnings";
   if (/\b(dividend|distribution|DRP|DRIP)\b/i.test(text))       return "dividend";
   if (/\b(split|consolidation|subdivision|bonus issue)\b/i.test(text)) return "split";
   if (/\b(scheme|takeover|merger|acquisition|offer|bid)\b/i.test(text)) return "merger_acquisition";

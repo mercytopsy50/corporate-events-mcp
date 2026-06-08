@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import { createContextMiddleware }               from "@ctxprotocol/sdk";
 import { DatabaseSync }                          from "node:sqlite";
@@ -388,7 +389,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         };
       }
 
-      const { events, hasMore } = await fetchEdgarHistorical(cik, companyName, ticker, fromDate, toDate, limit, offset);
+      const { events, hasMore, partial } = await fetchEdgarHistorical(cik, companyName, ticker, fromDate, toDate, limit, offset);
 
       db.upsertEvents(events);
       resolveAmendments(events);
@@ -418,7 +419,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           earliest_date:   events.length ? events[events.length - 1]!.announcement_date : null,
           latest_date:     events.length ? events[0]!.announcement_date : null,
         },
-        search_context: `All 8-K and 8-K/A filings for ${companyName} (${ticker}) between ${fromDate} and ${toDate} from SEC EDGAR. Amendment filings are flagged with is_amendment: true. This is a complete retrieval for this date window — a second call with the same query will return identical results.${hasMore ? " has_more: true means there are additional filings outside this page; increase offset to retrieve them." : ""}`,
+        search_context: `All 8-K and 8-K/A filings for ${companyName} (${ticker}) between ${fromDate} and ${toDate} from SEC EDGAR. Amendment filings are flagged with is_amendment: true. This is a complete retrieval for this date window — a second call with the same query will return identical results.${hasMore ? " has_more: true means there are additional filings outside this page; increase offset to retrieve them." : ""}${partial ? " partial: true means the 90s fetch budget was reached before all archive pages were read — narrow the date range or use offset pagination for complete coverage." : ""}`,
         query_params: { query, fromDate, toDate, limit, offset },
       };
     }

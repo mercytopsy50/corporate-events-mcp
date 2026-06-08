@@ -67,55 +67,141 @@ export async function fetchTickerMap(): Promise<TickerEntry[]> {
   }));
 }
 
-// ── Recent 8-K poll via EFTS ──────────────────────────────────────────────
+// ── Recent 8-K poll — EFTS primary, daily index fallback ──────────────────
+// EFTS (efts.sec.gov) is fast but occasionally returns 500 (transient) or
+// 403 (IP rate-limit from some hosting ranges). We retry 3x, then fall back
+// to EDGAR's daily form index which runs on a separate server path and has
+// never been observed to rate-limit.
 
-export async function fetchRecentEdgar8Ks(since: string): Promise<CorporateEvent[]> {
+async function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function tryEfts(since: string): Promise<CorporateEvent[] | null> {
   const today = new Date().toISOString().slice(0, 10);
-  const url   = `${EFTS_BASE}?forms=8-K,8-K%2FA&dateRange=custom&startdt=${since}&enddt=${today}&from=0&size=50`;
+  const url = `${EFTS_BASE}?forms=8-K&forms=8-K%2FA&dateRange=custom&startdt=${since}&enddt=${today}&from=0&size=50`;
+  const now = new Date().toISOString();
 
-  const res  = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20_000) });
-  if (!res.ok) throw new Error(`EDGAR EFTS HTTP ${res.status}`);
-  const data = await res.json() as EftsResponse;
-  const hits  = data?.hits?.hits ?? [];
-  const now   = new Date().toISOString();
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": UA },
+        signal:  AbortSignal.timeout(20_000),
+      });
+      if (res.status === 500 || res.status === 429) {
+        if (attempt < 3) { await sleep(attempt * 4_000); continue; }
+        return null;
+      }
+      if (!res.ok) return null;
+
+      const data  = await res.json() as EftsResponse;
+      const hits  = data?.hits?.hits ?? [];
+      const events: CorporateEvent[] = [];
+
+      for (const hit of hits) {
+        const s           = hit._source;
+        const itemsArr    = Array.isArray(s.items) ? s.items : [];
+        const itemsStr    = itemsArr.join(",");
+        const displayName = s.display_names?.[0] ?? "Unknown";
+        const { company, ticker } = parseDisplayName(displayName);
+        const cik         = s.ciks?.[0] ?? "";
+        const adsh        = s.adsh ?? "";
+        const fileDate    = s.file_date ?? today;
+        const formType    = s.form ?? "8-K";
+        const accFolder   = adsh.replace(/-/g, "");
+        const srcUrl      = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accFolder}/`;
+
+        events.push({
+          id:                createHash("sha256").update(`SEC_EDGAR:${adsh}`).digest("hex").slice(0, 24),
+          company,
+          ticker,
+          isin:              null,
+          jurisdiction:      "US",
+          event_type:        classifyEdgar8K(itemsStr, company),
+          event_date:        s.period_ending ?? null,
+          announcement_date: fileDate,
+          source:            "SEC_EDGAR",
+          source_url:        srcUrl,
+          raw_title:         `${formType}: ${describeItems(itemsArr)}`,
+          details: {
+            form_type:         formType,
+            items:             itemsArr,
+            item_descriptions: Object.fromEntries(itemsArr.map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
+            accession:         adsh,
+            filing_url:        srcUrl,
+          },
+          normalized_at: now,
+          is_amendment:  formType.endsWith("/A"),
+          amends_id:     null,
+        });
+      }
+      return events;
+    } catch {
+      if (attempt < 3) { await sleep(attempt * 4_000); continue; }
+      return null;
+    }
+  }
+  return null;
+}
+
+async function fetchEdgar8KsFromDailyIndex(
+  since: string,
+  lookupTicker: (cik: string) => string | null,
+): Promise<CorporateEvent[]> {
+  const d    = new Date(since + "T00:00:00Z");
+  const year = d.getUTCFullYear();
+  const qtr  = Math.ceil((d.getUTCMonth() + 1) / 3);
+  const url  = `https://www.sec.gov/Archives/edgar/daily-index/${year}/QTR${qtr}/form.idx`;
+
+  const res = await fetch(url, {
+    headers: { "User-Agent": UA },
+    signal:  AbortSignal.timeout(30_000),
+  }).catch(() => null);
+  if (!res?.ok) return [];
+
+  const text      = await res.text();
+  const sinceDate = since.slice(0, 10);
+  const now       = new Date().toISOString();
   const events: CorporateEvent[] = [];
 
-  for (const hit of hits) {
-    const s = hit._source;
+  for (const line of text.split("\n")) {
+    if (!line || line.startsWith("Form") || line.startsWith("----") || line.startsWith(" Form")) continue;
 
-    // items is a string[] in EFTS — join for classifier
-    const itemsArr    = Array.isArray(s.items) ? s.items : [];
-    const itemsStr    = itemsArr.join(",");
-    const displayName = s.display_names?.[0] ?? "Unknown";
-    const { company, ticker } = parseDisplayName(displayName);
-    const cik         = s.ciks?.[0] ?? "";
-    const adsh        = s.adsh ?? "";
-    const fileDate    = s.file_date ?? today;
-    const formType    = s.form ?? "8-K";
-    const eventType   = classifyEdgar8K(itemsStr, company);
+    const formType = line.slice(0,  12).trim();
+    if (!formType.startsWith("8-K")) continue;
 
-    // Build filing URL from accession (remove dashes for folder path)
-    const accFolder   = adsh.replace(/-/g, "");
-    const srcUrl      = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accFolder}/`;
+    const company  = line.slice(12, 74).trim();
+    const cikRaw   = line.slice(74, 86).trim();
+    const fileDate = line.slice(86, 97).trim();
+    const filename = line.slice(97).trim();
+    if (!fileDate || fileDate < sinceDate) continue;
+
+    const cikClean  = cikRaw.replace(/^0+/, "");
+    const accMatch  = filename.match(/(\d{10}-\d{2}-\d{6})/);
+    const adsh      = accMatch?.[1] ?? "";
+    const accFolder = adsh.replace(/-/g, "");
+    const srcUrl    = `https://www.sec.gov/Archives/edgar/data/${cikClean}/${accFolder}/`;
+    const ticker    = lookupTicker(cikClean);
+
+    if (!adsh) continue;
 
     events.push({
       id:                createHash("sha256").update(`SEC_EDGAR:${adsh}`).digest("hex").slice(0, 24),
-      company,
-      ticker,
+      company:           company || "Unknown",
+      ticker:            ticker ?? null,
       isin:              null,
       jurisdiction:      "US",
-      event_type:        eventType,
-      event_date:        s.period_ending ?? null,
+      event_type:        "other",
+      event_date:        null,
       announcement_date: fileDate,
       source:            "SEC_EDGAR",
       source_url:        srcUrl,
-      raw_title:         `${formType}: ${describeItems(itemsArr)}`,
+      raw_title:         `${formType}: Recent filing (daily index fallback)`,
       details: {
-        form_type:         formType,
-        items:             itemsArr,
-        item_descriptions: Object.fromEntries(itemsArr.map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
-        accession:         adsh,
-        filing_url:        srcUrl,
+        form_type:   formType,
+        items:       [],
+        accession:   adsh,
+        filing_url:  srcUrl,
       },
       normalized_at: now,
       is_amendment:  formType.endsWith("/A"),
@@ -123,6 +209,16 @@ export async function fetchRecentEdgar8Ks(since: string): Promise<CorporateEvent
     });
   }
   return events;
+}
+
+export async function fetchRecentEdgar8Ks(
+  since:        string,
+  lookupTicker: (cik: string) => string | null = () => null,
+): Promise<CorporateEvent[]> {
+  const eftsResult = await tryEfts(since);
+  if (eftsResult !== null) return eftsResult;
+  console.warn("[edgar] EFTS unavailable after 3 retries, falling back to daily-index");
+  return fetchEdgar8KsFromDailyIndex(since, lookupTicker);
 }
 
 // ── Company-specific lookup via submissions API ───────────────────────────
@@ -158,7 +254,7 @@ export async function fetchCompanyEdgarEvents(
     const accFmt   = accNum.replace(/\./g, "");
     const srcUrl   = `https://www.sec.gov/Archives/edgar/data/${paddedCIK.replace(/^0+/, "")}/${accFmt}/${doc}`;
 
-      const itemsArr    = items.split(",").map(s => s.trim()).filter(Boolean);
+      const itemsArr    = items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
       const description = describeItems(itemsArr);
     events.push({
       id:                createHash("sha256").update(`SEC_EDGAR:${accNum}`).digest("hex").slice(0, 24),
@@ -210,7 +306,7 @@ interface SubmissionsPage {
 
 interface SubmissionsWithFiles {
   name:    string;
-  filings: { recent: SubmissionsPage; files?: Array<{ name: string }> };
+  filings: { recent: SubmissionsPage; files?: Array<{ name: string; date?: string; filingCount?: number }> };
 }
 
 function buildEventsFromPage(
@@ -246,11 +342,11 @@ function buildEventsFromPage(
       announcement_date: fileDate,
       source:            "SEC_EDGAR",
       source_url:        srcUrl,
-      raw_title:         `${form}${isAmend ? "/A" : ""}: ${describeItems(items.split(",").map(s => s.trim()).filter(Boolean))}`,
+      raw_title:         `${form}${isAmend ? "/A" : ""}: ${describeItems(items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean))}`,
       details: {
         form_type:         form,
-        items:             items.split(",").map(s => s.trim()).filter(Boolean),
-        item_descriptions: Object.fromEntries(items.split(",").map(s => s.trim()).filter(Boolean).map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
+        items:             items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean),
+        item_descriptions: Object.fromEntries(items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
         accession:         accNum,
         filing_url:        `https://www.sec.gov/Archives/edgar/data/${cikClean}/${accFmt}/`,
         is_amendment:      isAmend,
@@ -273,9 +369,15 @@ export async function fetchEdgarHistorical(
   toDate:    string,
   maxEvents: number = 200,
   offset:    number = 0,
-): Promise<{ events: CorporateEvent[]; hasMore: boolean }> {
+): Promise<{ events: CorporateEvent[]; hasMore: boolean; partial?: boolean }> {
   const paddedCIK = cik.padStart(10, "0");
   const all: CorporateEvent[] = [];
+
+  // Hard wall: abort the entire fetch after 90s to prevent gateway timeouts.
+  // The platform cuts connections at 120s; staying well under that leaves room
+  // for the surrounding server logic and network variance.
+  const deadline = Date.now() + 90_000;
+  let   partial  = false;
 
   const res = await fetch(`${DATA_BASE}/CIK${paddedCIK}.json`, {
     headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20_000),
@@ -283,32 +385,52 @@ export async function fetchEdgarHistorical(
   if (!res.ok) throw new Error(`EDGAR submissions HTTP ${res.status}`);
   const root = await res.json() as SubmissionsWithFiles;
 
-  // Process recent page — filter to date window
-  const recentPage = root.filings.recent;
-  const recentEvents = buildEventsFromPage(recentPage, company, ticker, paddedCIK)
-    .filter(e => e.announcement_date >= fromDate && e.announcement_date <= toDate);
+  // Process the most-recent batch
+  const recentPage   = root.filings.recent;
+  const recentAll    = buildEventsFromPage(recentPage, company, ticker, paddedCIK);
+  const recentEvents = recentAll.filter(e => e.announcement_date >= fromDate && e.announcement_date <= toDate);
+  console.log(`[edgar-hist] ${company} recent page: ${recentAll.length} 8-Ks total, ${recentEvents.length} in ${fromDate}–${toDate}, oldest=${recentPage.filingDate?.at(-1) ?? "?"}`);
   all.push(...recentEvents);
 
-  // Walk older pages if fromDate is before the oldest recent filing
-  const oldestRecent = recentPage.filingDate.at(-1) ?? "9999-01-01";
-  const pages        = root.filings.files ?? [];
+  // Walk older archive pages only if our fromDate predates the recent batch.
+  // Bug fix: stop when the page's OLDEST filing is already BEFORE fromDate
+  // (we've gone back far enough) OR when the page's NEWEST filing is before
+  // our toDate window starts (we've gone too far back).
+  const pages   = root.filings.files ?? [];
+  const MAX_PAGES = 12;  // cap: prevents unbounded pagination on prolific filers
 
-  for (const page of pages) {
-    if (all.length >= maxEvents) break;
-    if (oldestRecent <= fromDate) break;  // already past our window
+  for (let i = 0; i < Math.min(pages.length, MAX_PAGES); i++) {
+    const page = pages[i]!;
 
-    const pr = await fetch(`${DATA_BASE}/${page.name}`, {
+    if (Date.now() > deadline) {
+      partial = true;
+      break;
+    }
+
+    const pr = await fetch(`https://data.sec.gov/${page.name}`, {
       headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15_000),
     }).catch(() => null);
-    if (!pr?.ok) continue;
+    if (!pr?.ok) {
+      console.log(`[edgar-hist] archive page ${i} (${page.name}) HTTP ${pr?.status ?? "network-err"} — skipping`);
+      continue;
+    }
 
-    const pd = await pr.json() as SubmissionsPage;
-    const pg = buildEventsFromPage(pd, company, ticker, paddedCIK)
+    const pd   = await pr.json() as SubmissionsPage;
+    const pg   = buildEventsFromPage(pd, company, ticker, paddedCIK)
       .filter(e => e.announcement_date >= fromDate && e.announcement_date <= toDate);
+    console.log(`[edgar-hist] archive page ${i} (${page.name}): ${pg.length} events in window`);
     all.push(...pg);
+
+    // If we already have more than enough events, stop fetching more pages
+    if (all.length >= maxEvents * 3) break;
   }
 
-  return { events: all.slice(offset, offset + maxEvents), hasMore: all.length > offset + maxEvents };
+  const slice = all.slice(offset, offset + maxEvents);
+  return {
+    events:   slice,
+    hasMore:  all.length > offset + maxEvents,
+    partial,
+  };
 }
 
 // ── SEC 8-K item code descriptions ───────────────────────────────────────
