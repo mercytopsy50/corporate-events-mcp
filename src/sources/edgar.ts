@@ -7,7 +7,7 @@ const EFTS_BASE   = "https://efts.sec.gov/LATEST/search-index";
 const DATA_BASE   = "https://data.sec.gov/submissions";
 const TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
 
-// ── Types ─────────────────────────────────────────────────────────────────
+// -- Types -----------------------------------------------------------------
 
 interface EftsSource {
   ciks?:          string[];
@@ -36,7 +36,7 @@ interface SubmissionsResponse {
   };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// -- Helpers ---------------------------------------------------------------
 
 /** Parse "CONMED Corp  (CNMD)  (CIK 0000816956)" → { company, ticker } */
 function parseDisplayName(raw: string): { company: string; ticker: string | null } {
@@ -45,7 +45,7 @@ function parseDisplayName(raw: string): { company: string; ticker: string | null
   return { company: raw.split("(")[0]!.trim(), ticker: null };
 }
 
-// ── Ticker → CIK map ──────────────────────────────────────────────────────
+// -- Ticker → CIK map ------------------------------------------------------
 
 export interface TickerEntry {
   ticker:       string;
@@ -67,7 +67,7 @@ export async function fetchTickerMap(): Promise<TickerEntry[]> {
   }));
 }
 
-// ── Recent 8-K poll — EFTS primary, daily index fallback ──────────────────
+// -- Recent 8-K poll — EFTS primary, daily index fallback ------------------
 // EFTS (efts.sec.gov) is fast but occasionally returns 500 (transient) or
 // 403 (IP rate-limit from some hosting ranges). We retry 3x, then fall back
 // to EDGAR's daily form index which runs on a separate server path and has
@@ -221,7 +221,7 @@ export async function fetchRecentEdgar8Ks(
   return fetchEdgar8KsFromDailyIndex(since, lookupTicker);
 }
 
-// ── Company-specific lookup via submissions API ───────────────────────────
+// -- Company-specific lookup via submissions API ---------------------------
 
 export async function fetchCompanyEdgarEvents(
   cik:         string,
@@ -285,16 +285,14 @@ export async function fetchCompanyEdgarEvents(
   return events;
 }
 
-// ── Amendment flag helper ─────────────────────────────────────────────────
+// -- Amendment flag helper -------------------------------------------------
 
 /** Returns true if the form type is an amendment (8-K/A). */
 export function isAmendmentForm(form: string): boolean {
   return form.endsWith("/A");
 }
 
-// ── Historical fetch — pages through all submissions back to fromDate ────
-// EDGAR submissions API: main file has filings.recent (~40 latest) plus
-// filings.files[] pointing to older batches. We walk pages until fromDate.
+// -- Submissions API page types ---------------------------------------------
 
 interface SubmissionsPage {
   form:            string[];
@@ -306,7 +304,7 @@ interface SubmissionsPage {
 
 interface SubmissionsWithFiles {
   name:    string;
-  filings: { recent: SubmissionsPage; files?: Array<{ name: string; date?: string; filingCount?: number }> };
+  filings: { recent: SubmissionsPage; files?: Array<{ name: string; date?: string }> };
 }
 
 function buildEventsFromPage(
@@ -315,7 +313,7 @@ function buildEventsFromPage(
   ticker:    string | null,
   paddedCIK: string,
 ): CorporateEvent[] {
-  const now    = new Date().toISOString();
+  const now      = new Date().toISOString();
   const events: CorporateEvent[] = [];
   const cikClean = paddedCIK.replace(/^0+/, "");
 
@@ -323,13 +321,14 @@ function buildEventsFromPage(
     const form = page.form[i]!;
     if (form !== "8-K" && form !== "8-K/A") continue;
 
-    const fileDate    = page.filingDate[i]!;
-    const accNum      = page.accessionNumber[i]!;
-    const items       = page.items[i] ?? "";
-    const doc         = page.primaryDocument[i] ?? "";
-    const accFmt      = accNum.replace(/\./g, "");
-    const srcUrl      = `https://www.sec.gov/Archives/edgar/data/${cikClean}/${accFmt}/${doc}`;
-    const isAmend     = form === "8-K/A";
+    const fileDate  = page.filingDate[i]!;
+    const accNum    = page.accessionNumber[i]!;
+    const items     = page.items[i] ?? "";
+    const doc       = page.primaryDocument[i] ?? "";
+    const accFmt    = accNum.replace(/\./g, "");
+    const srcUrl    = `https://www.sec.gov/Archives/edgar/data/${cikClean}/${accFmt}/${doc}`;
+    const isAmend   = form === "8-K/A";
+    const itemsArr  = items.split(",").map(s => s.trim()).filter(Boolean);
 
     events.push({
       id:                createHash("sha256").update(`SEC_EDGAR:${accNum}`).digest("hex").slice(0, 24),
@@ -342,18 +341,18 @@ function buildEventsFromPage(
       announcement_date: fileDate,
       source:            "SEC_EDGAR",
       source_url:        srcUrl,
-      raw_title:         `${form}${isAmend ? "/A" : ""}: ${describeItems(items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean))}`,
+      raw_title:         `${form}${isAmend ? "/A" : ""}: ${describeItems(itemsArr)}`,
       details: {
         form_type:         form,
-        items:             items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean),
-        item_descriptions: Object.fromEntries(items.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
+        items:             itemsArr,
+        item_descriptions: Object.fromEntries(itemsArr.map(c => [c, ITEM_DESCRIPTIONS[c] ?? `Item ${c}`])),
         accession:         accNum,
         filing_url:        `https://www.sec.gov/Archives/edgar/data/${cikClean}/${accFmt}/`,
         is_amendment:      isAmend,
       },
       normalized_at: now,
       is_amendment:  isAmend,
-      amends_id:     null,   // resolved post-insert via DB lookup in server.ts
+      amends_id:     null,
     });
 
     if (events.length >= 500) break;
@@ -372,10 +371,6 @@ export async function fetchEdgarHistorical(
 ): Promise<{ events: CorporateEvent[]; hasMore: boolean; partial?: boolean }> {
   const paddedCIK = cik.padStart(10, "0");
   const all: CorporateEvent[] = [];
-
-  // Hard wall: abort the entire fetch after 90s to prevent gateway timeouts.
-  // The platform cuts connections at 120s; staying well under that leaves room
-  // for the surrounding server logic and network variance.
   const deadline = Date.now() + 90_000;
   let   partial  = false;
 
@@ -385,55 +380,43 @@ export async function fetchEdgarHistorical(
   if (!res.ok) throw new Error(`EDGAR submissions HTTP ${res.status}`);
   const root = await res.json() as SubmissionsWithFiles;
 
-  // Process the most-recent batch
   const recentPage   = root.filings.recent;
   const recentAll    = buildEventsFromPage(recentPage, company, ticker, paddedCIK);
   const recentEvents = recentAll.filter(e => e.announcement_date >= fromDate && e.announcement_date <= toDate);
   console.log(`[edgar-hist] ${company} recent page: ${recentAll.length} 8-Ks total, ${recentEvents.length} in ${fromDate}–${toDate}, oldest=${recentPage.filingDate?.at(-1) ?? "?"}`);
   all.push(...recentEvents);
 
-  // Walk older archive pages only if our fromDate predates the recent batch.
-  // Bug fix: stop when the page's OLDEST filing is already BEFORE fromDate
-  // (we've gone back far enough) OR when the page's NEWEST filing is before
-  // our toDate window starts (we've gone too far back).
-  const pages   = root.filings.files ?? [];
-  const MAX_PAGES = 12;  // cap: prevents unbounded pagination on prolific filers
+  const pages = root.filings.files ?? [];
 
-  for (let i = 0; i < Math.min(pages.length, MAX_PAGES); i++) {
-    const page = pages[i]!;
-
+  for (const page of pages) {
     if (Date.now() > deadline) {
       partial = true;
+      console.warn(`[edgar-hist] 90s deadline reached — returning ${all.length} events so far`);
       break;
     }
 
-    const pr = await fetch(`https://data.sec.gov/${page.name}`, {
+    const pr = await fetch(`${DATA_BASE}/${page.name}`, {
       headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15_000),
     }).catch(() => null);
-    if (!pr?.ok) {
-      console.log(`[edgar-hist] archive page ${i} (${page.name}) HTTP ${pr?.status ?? "network-err"} — skipping`);
-      continue;
-    }
+    if (!pr?.ok) continue;
 
-    const pd   = await pr.json() as SubmissionsPage;
-    const pg   = buildEventsFromPage(pd, company, ticker, paddedCIK)
+    const pd = await pr.json() as SubmissionsPage;
+    const pg = buildEventsFromPage(pd, company, ticker, paddedCIK)
       .filter(e => e.announcement_date >= fromDate && e.announcement_date <= toDate);
-    console.log(`[edgar-hist] archive page ${i} (${page.name}): ${pg.length} events in window`);
     all.push(...pg);
 
-    // If we already have more than enough events, stop fetching more pages
     if (all.length >= maxEvents * 3) break;
   }
 
   const slice = all.slice(offset, offset + maxEvents);
   return {
-    events:   slice,
-    hasMore:  all.length > offset + maxEvents,
+    events:  slice,
+    hasMore: all.length > offset + maxEvents,
     partial,
   };
 }
 
-// ── SEC 8-K item code descriptions ───────────────────────────────────────
+// -- SEC 8-K item code descriptions ---------------------------------------
 // Maps official item codes to plain-English descriptions so agents can
 // reason about what each filing covers without needing SEC documentation.
 
