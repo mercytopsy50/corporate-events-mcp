@@ -371,7 +371,7 @@ export async function fetchEdgarHistorical(
 ): Promise<{ events: CorporateEvent[]; hasMore: boolean; partial?: boolean }> {
   const paddedCIK = cik.padStart(10, "0");
   const all: CorporateEvent[] = [];
-  const deadline = Date.now() + 90_000;
+  const deadline = Date.now() + 45_000;  // 45s hard budget — platform kills MCP calls at ~60s
   let   partial  = false;
 
   const res = await fetch(`${DATA_BASE}/CIK${paddedCIK}.json`, {
@@ -396,7 +396,7 @@ export async function fetchEdgarHistorical(
     }
 
     const pr = await fetch(`${DATA_BASE}/${page.name}`, {
-      headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15_000),
+      headers: { "User-Agent": UA }, signal: AbortSignal.timeout(8_000),
     }).catch(() => null);
     if (!pr?.ok) continue;
 

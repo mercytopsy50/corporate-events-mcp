@@ -179,7 +179,6 @@ const TOOLS = [
     description: [
       "Return the most recent corporate events across all jurisdictions, ordered by ingestion time.",
       "Useful for a live feed view: 'what happened in the last 24 hours across US, UK, Canada, Australia?'",
-      "Events appear within minutes of being filed — SEC EDGAR polls hourly, RNS every 2 hours.",
     ].join(" "),
     inputSchema: {
       type: "object",
@@ -244,7 +243,6 @@ const TOOLS = [
       "Fetch historical 8-K filings for a US company from SEC EDGAR, going back years or decades.",
       "EDGAR history extends to the early 1990s for all public US companies.",
       "Useful for multi-year earnings records, historical M&A activity, or long-term dividend history.",
-      "UK/CA/AU sources do not support deep historical depth — this tool is US (SEC EDGAR) only.",
     ].join(" "),
     inputSchema: {
       type: "object",
@@ -319,7 +317,6 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return {
         events,
         total_found:    events.length,
-        search_context: `Searched company, ticker, and ISIN fields for '${query}' across all four jurisdictions (US, UK, CA, AU) over the last ${daysBack} days. A second call with just the ticker or company name will return the same results — this tool matches on all three identifiers simultaneously.`,
         query_params:   { query, daysBack, limit },
       };
     }
@@ -389,14 +386,33 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         };
       }
 
-      const { events, hasMore, partial } = await fetchEdgarHistorical(cik, companyName, ticker, fromDate, toDate, limit, offset);
+      const { events, hasMore, partial, allEvents } = await (async () => {
+        // Cache the full event array keyed by (cik, fromDate, toDate) only —
+        // no offset or limit in the key. This means the first call for any
+        // (company, date range) fetches EDGAR once (36s). All subsequent calls
+        // at any offset or limit — including the model paginating through pages —
+        // are served from the same cached array in <1ms.
+        const fullKey    = `hist-full:${cik}:${fromDate}:${toDate}`;
+        const cachedFull = db.getCachedHistoricalFull(fullKey);
+
+        if (cachedFull) {
+          const slice = cachedFull.slice(offset, offset + limit);
+          return { events: slice, hasMore: cachedFull.length > offset + limit, partial: false, allEvents: cachedFull };
+        }
+
+        // Cold path: fetch with limit=500 so we get all events in one EDGAR
+        // fetch (most companies have <500 8-Ks in any multi-year range).
+        const result = await fetchEdgarHistorical(cik!, companyName, ticker, fromDate, toDate, 500, 0);
+        if (!result.partial) {
+          db.setCachedHistoricalFull(fullKey, result.events);
+        }
+        const slice = result.events.slice(offset, offset + limit);
+        return { events: slice, hasMore: result.hasMore || result.events.length > offset + limit, partial: result.partial, allEvents: result.events };
+      })();
 
       db.upsertEvents(events);
       resolveAmendments(events);
 
-      // Pre-compute summary so the model does not need code_interpreter to
-      // answer "how many earnings events were there per year" — a query that
-      // previously caused 7+ code_interpreter calls for a 200-event result set.
       const byType:  Record<string, number> = {};
       const byYear:  Record<string, number> = {};
       let   amendmentCount = 0;
@@ -407,19 +423,82 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         if (ev.is_amendment) amendmentCount++;
       }
 
+      // Lean event shape — fields commented out are available via get_company_events
+      // for drill-down. Keeping the bulk response small prevents platform truncation,
+      // which is what forces the model into expensive code_interpreter processing.
+      type EvDetails = Record<string, unknown>;
+      const leanEvents = events
+        .slice()
+        .sort((a, b) => a.announcement_date.localeCompare(b.announcement_date))
+        .map(ev => ({
+          id:                ev.id,
+          announcement_date: ev.announcement_date,
+          event_type:        ev.event_type,
+          raw_title:         ev.raw_title,
+          source_url:        ev.source_url,
+          is_amendment:      ev.is_amendment,
+          amends_id:         ev.amends_id,
+          // fields omitted from bulk response to reduce response size:
+          // company:        ev.company,
+          // ticker:         ev.ticker,
+          // isin:           ev.isin,
+          // jurisdiction:   ev.jurisdiction,
+          // event_date:     ev.event_date,
+          // source:         ev.source,
+          // normalized_at:  ev.normalized_at,
+          // details: {
+          //   form_type:         (ev.details as EvDetails)["form_type"],
+          //   items:             (ev.details as EvDetails)["items"],
+          //   item_descriptions: (ev.details as EvDetails)["item_descriptions"],
+          //   accession:         (ev.details as EvDetails)["accession"],
+          //   filing_url:        (ev.details as EvDetails)["filing_url"],
+          // },
+        }));
+
+      // Pre-computed subsets — O(1) path lookup for the evidence engine instead
+      // of an O(N) scan through the full events array.
+      const earningsEvents   = leanEvents.filter(e => e.event_type === "earnings");
+      const amendmentEvents  = leanEvents.filter(e => e.is_amendment);
+
+      // range_summary covers ALL events in the date range across all pages —
+      // not just this page. This means the model never needs to paginate just
+      // to compute totals; a single call gives the complete picture.
+      const rangeByType:  Record<string, number> = {};
+      const rangeByYear:  Record<string, number> = {};
+      let   rangeAmendments = 0;
+      for (const ev of (allEvents ?? events)) {
+        rangeByType[ev.event_type] = (rangeByType[ev.event_type] ?? 0) + 1;
+        const yr = ev.announcement_date.slice(0, 4);
+        rangeByYear[yr] = (rangeByYear[yr] ?? 0) + 1;
+        if (ev.is_amendment) rangeAmendments++;
+      }
+
       return {
-        events,
-        total_found:    events.length,
-        has_more:       hasMore,
+        events:           leanEvents,
+        earnings_events:  earningsEvents,
+        amendments:       amendmentEvents,
+        events_in_page:   events.length,
+        has_more:         hasMore,
+        total_is_known:   !hasMore,
         offset,
+        range_summary: {
+          total_events:    (allEvents ?? events).length,
+          by_event_type:   rangeByType,
+          by_year:         rangeByYear,
+          amendment_count: rangeAmendments,
+          earliest_date:   (allEvents ?? events).length ? (allEvents ?? events)[(allEvents ?? events).length - 1]!.announcement_date : null,
+          latest_date:     (allEvents ?? events)[0]?.announcement_date ?? null,
+          complete:        !partial,
+        },
         summary: {
           by_event_type:   byType,
           by_year:         byYear,
           amendment_count: amendmentCount,
           earliest_date:   events.length ? events[events.length - 1]!.announcement_date : null,
-          latest_date:     events.length ? events[0]!.announcement_date : null,
+          latest_date:     events[0]?.announcement_date ?? null,
+          note:            hasMore ? "page-scoped — see range_summary for complete date range totals" : "complete",
         },
-        search_context: `All 8-K and 8-K/A filings for ${companyName} (${ticker}) between ${fromDate} and ${toDate} from SEC EDGAR. Amendment filings are flagged with is_amendment: true. This is a complete retrieval for this date window — a second call with the same query will return identical results.${hasMore ? " has_more: true means there are additional filings outside this page; increase offset to retrieve them." : ""}${partial ? " partial: true means the 90s fetch budget was reached before all archive pages were read — narrow the date range or use offset pagination for complete coverage." : ""}`,
+        search_context: `All 8-K and 8-K/A filings for ${companyName} (${ticker}) between ${fromDate} and ${toDate} from SEC EDGAR. range_summary contains complete statistics for ALL ${(allEvents ?? events).length} events across the full date range — use it for totals and breakdowns without paginating. Pre-computed subsets: earnings_events (${earningsEvents.length} items on this page) and amendments (${amendmentEvents.length} items on this page) are available as top-level keys.${hasMore ? ` This page contains ${events.length} events (offset ${offset}). has_more: true — further events exist; use offset=${offset + limit} to retrieve the next page.` : " This is the complete result set for this date window."}${partial ? " partial: true means the 45s fetch budget was reached — narrow the date range for complete coverage." : ""}`,
         query_params: { query, fromDate, toDate, limit, offset },
       };
     }

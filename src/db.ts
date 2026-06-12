@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS ticker_cache (
   company_name TEXT NOT NULL,
   cached_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS historical_cache (
+  cache_key  TEXT PRIMARY KEY,
+  result     TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 `;
 
 // ── DB wrapper ────────────────────────────────────────────────────────────
@@ -242,7 +248,43 @@ export class EventsDB {
     };
   }
 
-  // ── inline pipeline status for zero-result responses ─────────────────
+  // ── Historical result cache (24h TTL) ────────────────────────────────────
+
+  getCachedHistorical(key: string): { events: CorporateEvent[]; hasMore: boolean; partial?: boolean } | null {
+    const row = this.db.prepare(
+      "SELECT result FROM historical_cache WHERE cache_key = ? AND expires_at > ?",
+    ).get(key, Date.now()) as { result: string } | undefined;
+    if (!row) return null;
+    try { return JSON.parse(row.result); } catch { return null; }
+  }
+
+  setCachedHistorical(key: string, result: { events: CorporateEvent[]; hasMore: boolean; partial?: boolean }): void {
+    const ttl = 24 * 60 * 60 * 1000;
+    this.db.prepare(`
+      INSERT INTO historical_cache (cache_key, result, expires_at) VALUES (?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET result = excluded.result, expires_at = excluded.expires_at
+    `).run(key, JSON.stringify(result), Date.now() + ttl);
+  }
+
+  // Full event array cache — keyed without offset/limit so all pagination
+  // variants for the same company+range share one EDGAR fetch.
+  getCachedHistoricalFull(key: string): CorporateEvent[] | null {
+    const row = this.db.prepare(
+      "SELECT result FROM historical_cache WHERE cache_key = ? AND expires_at > ?",
+    ).get(key, Date.now()) as { result: string } | undefined;
+    if (!row) return null;
+    try { return JSON.parse(row.result) as CorporateEvent[]; } catch { return null; }
+  }
+
+  setCachedHistoricalFull(key: string, events: CorporateEvent[]): void {
+    const ttl = 24 * 60 * 60 * 1000;
+    this.db.prepare(`
+      INSERT INTO historical_cache (cache_key, result, expires_at) VALUES (?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET result = excluded.result, expires_at = excluded.expires_at
+    `).run(key, JSON.stringify(events), Date.now() + ttl);
+  }
+
+  // ── Jurisdiction health (inline zero-result pipeline status) ─────────────
   // Called automatically by search_events / get_recent_events when total=0
   // so the model gets pipeline health in the same response and never needs
   // a separate get_pipeline_health call just to verify the pipeline is alive.
